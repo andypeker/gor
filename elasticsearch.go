@@ -2,67 +2,81 @@ package main
 
 import (
 	"encoding/json"
-	"github.com/buger/elastigo/api"
-	"github.com/buger/elastigo/core"
-	"github.com/buger/gor/proto"
 	"log"
-	"regexp"
+	"net/url"
+	"strings"
 	"time"
+
+	"github.com/buger/goreplay/proto"
+
+	elastigo "github.com/mattbaird/elastigo/lib"
 )
 
 type ESUriErorr struct{}
 
 func (e *ESUriErorr) Error() string {
-	return "Wrong ElasticSearch URL format. Expected to be: host:port/index_name"
+	return "Wrong ElasticSearch URL format. Expected to be: scheme://host/index_name"
 }
 
 type ESPlugin struct {
 	Active  bool
 	ApiPort string
+	eConn   *elastigo.Conn
 	Host    string
 	Index   string
-	indexor *core.BulkIndexer
+	indexor *elastigo.BulkIndexer
 	done    chan bool
 }
 
 type ESRequestResponse struct {
-	ReqUrl               []byte `json:"Req_URL"`
-	ReqMethod            []byte `json:"Req_Method"`
-	ReqUserAgent         []byte `json:"Req_User-Agent"`
-	ReqAcceptLanguage    []byte `json:"Req_Accept-Language,omitempty"`
-	ReqAccept            []byte `json:"Req_Accept,omitempty"`
-	ReqAcceptEncoding    []byte `json:"Req_Accept-Encoding,omitempty"`
-	ReqIfModifiedSince   []byte `json:"Req_If-Modified-Since,omitempty"`
-	ReqConnection        []byte `json:"Req_Connection,omitempty"`
-	ReqCookies           []byte `json:"Req_Cookies,omitempty"`
-	RespStatus           []byte `json:"Resp_Status"`
-	RespStatusCode       []byte `json:"Resp_Status-Code"`
-	RespProto            []byte `json:"Resp_Proto,omitempty"`
-	RespContentLength    []byte `json:"Resp_Content-Length,omitempty"`
-	RespContentType      []byte `json:"Resp_Content-Type,omitempty"`
-	RespTransferEncoding []byte `json:"Resp_Transfer-Encoding,omitempty"`
-	RespContentEncoding  []byte `json:"Resp_Content-Encoding,omitempty"`
-	RespExpires          []byte `json:"Resp_Expires,omitempty"`
-	RespCacheControl     []byte `json:"Resp_Cache-Control,omitempty"`
-	RespVary             []byte `json:"Resp_Vary,omitempty"`
-	RespSetCookie        []byte `json:"Resp_Set-Cookie,omitempty"`
+	ReqURL               string `json:"Req_URL"`
+	ReqMethod            string `json:"Req_Method"`
+	ReqUserAgent         string `json:"Req_User-Agent"`
+	ReqAcceptLanguage    string `json:"Req_Accept-Language,omitempty"`
+	ReqAccept            string `json:"Req_Accept,omitempty"`
+	ReqAcceptEncoding    string `json:"Req_Accept-Encoding,omitempty"`
+	ReqIfModifiedSince   string `json:"Req_If-Modified-Since,omitempty"`
+	ReqConnection        string `json:"Req_Connection,omitempty"`
+	ReqCookies           string `json:"Req_Cookies,omitempty"`
+	RespStatus           string `json:"Resp_Status"`
+	RespStatusCode       string `json:"Resp_Status-Code"`
+	RespProto            string `json:"Resp_Proto,omitempty"`
+	RespContentLength    string `json:"Resp_Content-Length,omitempty"`
+	RespContentType      string `json:"Resp_Content-Type,omitempty"`
+	RespTransferEncoding string `json:"Resp_Transfer-Encoding,omitempty"`
+	RespContentEncoding  string `json:"Resp_Content-Encoding,omitempty"`
+	RespExpires          string `json:"Resp_Expires,omitempty"`
+	RespCacheControl     string `json:"Resp_Cache-Control,omitempty"`
+	RespVary             string `json:"Resp_Vary,omitempty"`
+	RespSetCookie        string `json:"Resp_Set-Cookie,omitempty"`
 	Rtt                  int64  `json:"RTT"`
 	Timestamp            time.Time
 }
 
 // Parse ElasticSearch URI
 //
-// Proper format is: host:port/index_name
-func parseURI(URI string) (err error, host string, port string, index string) {
-	rURI := regexp.MustCompile("(.+):([0-9]+)/(.+)")
-	match := rURI.FindAllStringSubmatch(URI, -1)
+// Proper format is: scheme://[userinfo@]host/index_name
+// userinfo is: user[:password]
+// net/url.Parse() does not fail if scheme is not provided but actually does not
+// handle URI properly.
+// So we must 'validate' URI format to match requirements to use net/url.Parse()
+func parseURI(URI string) (err error, index string) {
 
-	if len(match) == 0 {
+	parsedUrl, parseErr := url.Parse(URI)
+
+	if parseErr != nil {
 		err = new(ESUriErorr)
-	} else {
-		host = match[0][1]
-		port = match[0][2]
-		index = match[0][3]
+		return
+	}
+
+	//	check URL validity by extracting host and index values.
+	host := parsedUrl.Host
+	urlPathParts := strings.Split(parsedUrl.Path, "/")
+	index = urlPathParts[len(urlPathParts)-1]
+
+	// force index specification in uri : ie no implicit index
+	if host == "" || index == "" {
+		err = new(ESUriErorr)
 	}
 
 	return
@@ -71,36 +85,35 @@ func parseURI(URI string) (err error, host string, port string, index string) {
 func (p *ESPlugin) Init(URI string) {
 	var err error
 
-	err, p.Host, p.ApiPort, p.Index = parseURI(URI)
+	err, p.Index = parseURI(URI)
 
 	if err != nil {
 		log.Fatal("Can't initialize ElasticSearch plugin.", err)
 	}
 
-	api.Domain = p.Host
-	api.Port = p.ApiPort
+	p.eConn = elastigo.NewConn()
 
-	p.indexor = core.NewBulkIndexerErrors(50, 60)
+	p.eConn.SetFromUrl(URI)
+
+	p.indexor = p.eConn.NewBulkIndexerErrors(50, 60)
 	p.done = make(chan bool)
-	p.indexor.Run(p.done)
+	p.indexor.Start()
 
-	// Only start the ErrorHandler goroutine when in verbose mode
-	// no need to burn ressources otherwise
-	// go p.ErrorHandler()
+	go p.ErrorHandler()
 
-	log.Println("Initialized Elasticsearch Plugin")
+	Debug(1, "Initialized Elasticsearch Plugin")
 	return
 }
 
 func (p *ESPlugin) IndexerShutdown() {
-	p.done <- true
+	p.indexor.Stop()
 	return
 }
 
 func (p *ESPlugin) ErrorHandler() {
 	for {
 		errBuf := <-p.indexor.ErrorChannel
-		log.Println(errBuf.Err)
+		Debug(1, "[ELASTICSEARCH]", errBuf.Err)
 	}
 }
 
@@ -111,6 +124,7 @@ func (p *ESPlugin) RttDurationToMs(d time.Duration) int64 {
 	return int64(fl)
 }
 
+// ResponseAnalyze send req and resp to ES
 func (p *ESPlugin) ResponseAnalyze(req, resp []byte, start, stop time.Time) {
 	if len(resp) == 0 {
 		// nil http response - skipped elasticsearch export for this request
@@ -120,34 +134,34 @@ func (p *ESPlugin) ResponseAnalyze(req, resp []byte, start, stop time.Time) {
 	rtt := p.RttDurationToMs(stop.Sub(start))
 
 	esResp := ESRequestResponse{
-		ReqUrl:               proto.Path(req),
-		ReqMethod:            proto.Method(req),
-		ReqUserAgent:         proto.Header(req, []byte("User-Agent")),
-		ReqAcceptLanguage:    proto.Header(req, []byte("Accept-Language")),
-		ReqAccept:            proto.Header(req, []byte("Accept")),
-		ReqAcceptEncoding:    proto.Header(req, []byte("Accept-Encoding")),
-		ReqIfModifiedSince:   proto.Header(req, []byte("If-Modified-Since")),
-		ReqConnection:        proto.Header(req, []byte("Connection")),
-		ReqCookies:           proto.Header(req, []byte("Cookie")),
-		RespStatus:           proto.Status(resp),
-		RespStatusCode:       proto.Status(resp),
-		RespProto:            proto.Method(resp),
-		RespContentLength:    proto.Header(resp, []byte("Content-Length")),
-		RespContentType:      proto.Header(resp, []byte("Content-Type")),
-		RespTransferEncoding: proto.Header(resp, []byte("Transfer-Encoding")),
-		RespContentEncoding:  proto.Header(resp, []byte("Content-Encoding")),
-		RespExpires:          proto.Header(resp, []byte("Expires")),
-		RespCacheControl:     proto.Header(resp, []byte("Cache-Control")),
-		RespVary:             proto.Header(resp, []byte("Vary")),
-		RespSetCookie:        proto.Header(resp, []byte("Set-Cookie")),
+		ReqURL:               string(proto.Path(req)),
+		ReqMethod:            string(proto.Method(req)),
+		ReqUserAgent:         string(proto.Header(req, []byte("User-Agent"))),
+		ReqAcceptLanguage:    string(proto.Header(req, []byte("Accept-Language"))),
+		ReqAccept:            string(proto.Header(req, []byte("Accept"))),
+		ReqAcceptEncoding:    string(proto.Header(req, []byte("Accept-Encoding"))),
+		ReqIfModifiedSince:   string(proto.Header(req, []byte("If-Modified-Since"))),
+		ReqConnection:        string(proto.Header(req, []byte("Connection"))),
+		ReqCookies:           string(proto.Header(req, []byte("Cookie"))),
+		RespStatus:           string(proto.Status(resp)),
+		RespStatusCode:       string(proto.Status(resp)),
+		RespProto:            string(proto.Method(resp)),
+		RespContentLength:    string(proto.Header(resp, []byte("Content-Length"))),
+		RespContentType:      string(proto.Header(resp, []byte("Content-Type"))),
+		RespTransferEncoding: string(proto.Header(resp, []byte("Transfer-Encoding"))),
+		RespContentEncoding:  string(proto.Header(resp, []byte("Content-Encoding"))),
+		RespExpires:          string(proto.Header(resp, []byte("Expires"))),
+		RespCacheControl:     string(proto.Header(resp, []byte("Cache-Control"))),
+		RespVary:             string(proto.Header(resp, []byte("Vary"))),
+		RespSetCookie:        string(proto.Header(resp, []byte("Set-Cookie"))),
 		Rtt:                  rtt,
 		Timestamp:            t,
 	}
 	j, err := json.Marshal(&esResp)
 	if err != nil {
-		log.Println(err)
+		Debug(0, "[ELASTIC-RESPONSE]", err)
 	} else {
-		p.indexor.Index(p.Index, "RequestResponse", "", "", &t, j, true)
+		p.indexor.Index(p.Index, "RequestResponse", "", "", "", &t, j)
 	}
 	return
 }

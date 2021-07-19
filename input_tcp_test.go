@@ -1,27 +1,38 @@
 package main
 
 import (
-	"encoding/hex"
-	"io"
+	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"io/ioutil"
 	"log"
+	"math/big"
 	"net"
+	"os"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestTCPInput(t *testing.T) {
 	wg := new(sync.WaitGroup)
-	quit := make(chan int)
 
-	input := NewTCPInput(":0")
-	output := NewTestOutput(func(data []byte) {
+	input := NewTCPInput("127.0.0.1:0", &TCPInputConfig{})
+	output := NewTestOutput(func(*Message) {
 		wg.Done()
 	})
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []PluginReader{input},
+		Outputs: []PluginWriter{output},
+	}
+	plugins.All = append(plugins.All, input, output)
 
-	go Start(quit)
+	emitter := NewEmitter()
+	go emitter.Start(plugins, Settings.Middleware)
 
 	tcpAddr, err := net.ResolveTCPAddr("tcp", input.listener.Addr().String())
 
@@ -30,84 +41,102 @@ func TestTCPInput(t *testing.T) {
 	}
 
 	conn, err := net.DialTCP("tcp", nil, tcpAddr)
-
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	msg := []byte("GET / HTTP/1.1\r\n\r\n")
+	msg := []byte("1 1 1\nGET / HTTP/1.1\r\n\r\n")
 
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
-
-		encoded := make([]byte, len(msg)*2)
-		hex.Encode(encoded, msg)
-		conn.Write(append(encoded, '\n'))
+		if _, err = conn.Write(msg); err == nil {
+			_, err = conn.Write(payloadSeparatorAsBytes)
+		}
+		if err != nil {
+			t.Error(err)
+			return
+		}
 	}
-
 	wg.Wait()
-
-	close(quit)
+	emitter.Close()
 }
 
-func BenchmarkTCPInput(b *testing.B) {
-	wg := new(sync.WaitGroup)
-	quit := make(chan int)
+func genCertificate(template *x509.Certificate) ([]byte, []byte) {
+	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
 
-	input := NewTCPInput(":0")
-	output := NewTestOutput(func(data []byte) {
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, _ := rand.Int(rand.Reader, serialNumberLimit)
+	template.SerialNumber = serialNumber
+	template.BasicConstraintsValid = true
+	template.NotBefore = time.Now()
+	template.NotAfter = time.Now().Add(time.Hour)
+
+	derBytes, _ := x509.CreateCertificate(rand.Reader, template, template, &priv.PublicKey, priv)
+
+	var certPem, keyPem bytes.Buffer
+	pem.Encode(&certPem, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	pem.Encode(&keyPem, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+
+	return certPem.Bytes(), keyPem.Bytes()
+}
+
+func TestTCPInputSecure(t *testing.T) {
+	serverCertPem, serverPrivPem := genCertificate(&x509.Certificate{
+		DNSNames:    []string{"localhost"},
+		IPAddresses: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::")},
+	})
+
+	serverCertPemFile, _ := ioutil.TempFile("", "server.crt")
+	serverCertPemFile.Write(serverCertPem)
+	serverCertPemFile.Close()
+
+	serverPrivPemFile, _ := ioutil.TempFile("", "server.key")
+	serverPrivPemFile.Write(serverPrivPem)
+	serverPrivPemFile.Close()
+
+	defer func() {
+		os.Remove(serverPrivPemFile.Name())
+		os.Remove(serverCertPemFile.Name())
+	}()
+
+	wg := new(sync.WaitGroup)
+
+	input := NewTCPInput("127.0.0.1:0", &TCPInputConfig{
+		Secure:          true,
+		CertificatePath: serverCertPemFile.Name(),
+		KeyPath:         serverPrivPemFile.Name(),
+	})
+	output := NewTestOutput(func(*Message) {
 		wg.Done()
 	})
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []PluginReader{input},
+		Outputs: []PluginWriter{output},
+	}
+	plugins.All = append(plugins.All, input, output)
 
-	go Start(quit)
+	emitter := NewEmitter()
+	go emitter.Start(plugins, Settings.Middleware)
 
-	tcpAddr, err := net.ResolveTCPAddr("tcp", input.listener.Addr().String())
+	conf := &tls.Config{
+		InsecureSkipVerify: true,
+	}
 
+	conn, err := tls.Dial("tcp", input.listener.Addr().String(), conf)
 	if err != nil {
-		log.Fatal(err)
+		t.Fatal(err)
 	}
+	defer conn.Close()
 
-	var connections []net.Conn
+	msg := []byte("1 1 1\nGET / HTTP/1.1\r\n\r\n")
 
-	// Creating simple pool of workers, same as output_tcp have
-	dataChan := make(chan []byte, 1000)
-
-	for i := 0; i < 10; i++ {
-		conn, _ := net.DialTCP("tcp", nil, tcpAddr)
-		connections = append(connections, conn)
-
-		go func(conn net.Conn) {
-			for {
-				data := <-dataChan
-
-				buf := make([]byte, len(data)+2)
-				data = append(data, []byte("¶")...)
-				copy(buf, data)
-				conn.Write(buf)
-			}
-		}(conn)
-	}
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	msg := []byte("GET / HTTP/1.1\r\n\r\n")
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for i := 0; i < 100; i++ {
 		wg.Add(1)
-		dataChan <- msg
+		conn.Write(msg)
+		conn.Write([]byte(payloadSeparator))
 	}
 
 	wg.Wait()
-
-	for _, conn := range connections {
-		conn.Close()
-	}
-
-	close(quit)
+	emitter.Close()
 }

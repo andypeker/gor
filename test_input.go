@@ -1,28 +1,57 @@
 package main
 
 import (
-	"crypto/rand"
 	"encoding/base64"
+	"errors"
+	"math/rand"
+	"time"
 )
+
+// ErrorStopped is the error returned when the go routines reading the input is stopped.
+var ErrorStopped = errors.New("reading stopped")
 
 // TestInput used for testing purpose, it allows emitting requests on demand
 type TestInput struct {
-	data chan []byte
+	data       chan []byte
+	skipHeader bool
+	stop       chan bool // Channel used only to indicate goroutine should shutdown
 }
 
 // NewTestInput constructor for TestInput
 func NewTestInput() (i *TestInput) {
 	i = new(TestInput)
 	i.data = make(chan []byte, 100)
-
+	i.stop = make(chan bool)
 	return
 }
 
-func (i *TestInput) Read(data []byte) (int, error) {
-	buf := <-i.data
-	copy(data, buf)
+// PluginRead reads message from this plugin
+func (i *TestInput) PluginRead() (*Message, error) {
+	var msg Message
+	select {
+	case buf := <-i.data:
+		msg.Data = buf
+		if !i.skipHeader {
+			msg.Meta = payloadHeader(RequestPayload, uuid(), time.Now().UnixNano(), -1)
+		} else {
+			msg.Meta, msg.Data = payloadMetaWithBody(msg.Data)
+		}
 
-	return len(buf), nil
+		return &msg, nil
+	case <-i.stop:
+		return nil, ErrorStopped
+	}
+}
+
+// Close closes this plugin
+func (i *TestInput) Close() error {
+	close(i.stop)
+	return nil
+}
+
+// EmitBytes sends data
+func (i *TestInput) EmitBytes(data []byte) {
+	i.data <- data
 }
 
 // EmitGET emits GET request without headers
@@ -48,12 +77,22 @@ func (i *TestInput) EmitLargePOST() {
 
 	rs := base64.URLEncoding.EncodeToString(rb)
 
-	i.data <- []byte("POST / HTTP/1.1\nHost: www.w3.org\nContent-Length:5242880\r\n\r\n" + rs)
+	i.data <- []byte("POST / HTTP/1.1\r\nHost: www.w3.org\nContent-Length:5242880\r\n\r\n" + rs)
+}
+
+// EmitSizedPOST emit a POST with a payload set to a supplied size
+func (i *TestInput) EmitSizedPOST(payloadSize int) {
+	rb := make([]byte, payloadSize)
+	rand.Read(rb)
+
+	rs := base64.URLEncoding.EncodeToString(rb)
+
+	i.data <- []byte("POST / HTTP/1.1\r\nHost: www.w3.org\nContent-Length:5242880\r\n\r\n" + rs)
 }
 
 // EmitOPTIONS emits OPTIONS request, similar to GET
 func (i *TestInput) EmitOPTIONS() {
-	i.data <- []byte("OPTIONS / HTTP/1.1\nHost: www.w3.org\r\n\r\n")
+	i.data <- []byte("OPTIONS / HTTP/1.1\r\nHost: www.w3.org\r\n\r\n")
 }
 
 func (i *TestInput) String() string {

@@ -1,10 +1,11 @@
-FROM google/golang:1.4
+FROM alpine:3.12 as builder
 
-RUN cd /goroot/src/ && GOOS=linux GOARCH=386 ./make.bash --no-clean
+ARG RELEASE_VERSION
 
-WORKDIR /gopath/src/github.com/buger/gor/
+RUN apk add --no-cache ca-certificates openssl
+RUN wget https://github.com/buger/goreplay/releases/download/${RELEASE_VERSION}/gor_${RELEASE_VERSION}_x64.tar.gz -O gor.tar.gz
+RUN tar xzf gor.tar.gz
 
-ADD . /gopath/src/github.com/buger/gor/
-
-RUN go get -u github.com/golang/lint/golint
-RUN go get
+FROM scratch
+COPY --from=builder /gor .
+ENTRYPOINT ["./gor"]
